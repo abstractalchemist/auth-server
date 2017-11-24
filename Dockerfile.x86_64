@@ -1,0 +1,12 @@
+
+FROM alpine
+RUN apk update --no-cache && \
+    apk add --no-cache nodejs && \
+    mkdir /www
+
+WORKDIR /www
+COPY src/index.js /www
+COPY src/utils.js /www
+COPY node_modules /www/node_modules
+EXPOSE 9000
+CMD ["node", "index.js"]
