@@ -6,10 +6,10 @@ const { Observable } = require('rxjs');
 
 const { mapper, lister } = require('./utils')
 
-const { from } = Observable;
+const { from, create, of } = Observable;
 
 const app = express()
-app.use(bodyParser.json())
+//app.use(bodyParser.json())
 const db_host = process.env['COUCHDB_HOST'] || 'localhost'
 const db_port = process.env['COUCHDB_PORT'] || '5984'
 
@@ -72,6 +72,8 @@ from(httpPromise({path:"/",hostname:db_host,port:db_port,method:"HEAD"}))
 	})
 
 const checkAccessToken = function(token) {
+    if(typeof token === 'object')
+	token = token.headers['token']
     console.log(`checking access token ${token}`)
     return from(httpPromise({path:`/debug_token?input_token=${token}&access_token=${appid}|${appsecret}`, protocol:"https:", host:"graph.facebook.com"}))
 
@@ -133,6 +135,57 @@ const findOrCreateUserLibrary = function(user_id, rem) {
 		
 }
 
+
+const forward_response_headers = function({headers}, res) {
+    for(let i in headers) {
+	if(headers.hasOwnProperty(i))
+	    res.append(i, headers[i])
+    }
+    
+}
+
+const readRequestData = function(req) {
+    return create(observer => {
+	let buffer = []
+	req.on('data', d => buffer.push(d))
+	req.on('end', _ => {
+	    observer.next(buffer.join(''))
+	    observer.complete()
+	})
+    })
+    
+}
+
+const check_public_dbs = function({path}) {
+    return from(httpPromise({hostname:db_host,port:db_port,path:"/cardsets/sets"}))
+	.pluck('body')
+	.map(JSON.parse)
+	.mergeMap(({sets}) => {
+	    let request = /^\/api\/(.+)(\/(.+)){0,1}/.exec(path)
+	    if(request) {
+		console.log(`checking ${request[1]} `)
+		let valid = sets.filter( ({id}) => id === request[1] );
+		if(valid || request[1] === 'cardsets' || request[1] === 'cardmapping' || request[1] === '_uuids')
+		    return of(sets)
+		
+	    }
+	    throw new Error(`${path} is not a public url`)
+	})
+}
+
+const build_query_string = ({query}) => {
+    let buffer = []
+    if(query) {
+	for(let i in query) {
+	    if(query.hasOwnProperty(i)) {
+		buffer.push(`${i}=${query[i]}`)
+	    }
+	}
+    }
+    return buffer.join('&')
+
+}
+
 app.get(/^\/api\/(.+)/, (req, res) => {
 //    console.log(`api match, mapping to ${req.path}`)
     let match;
@@ -158,10 +211,7 @@ app.get(/^\/api\/(.+)/, (req, res) => {
 				    res.status(500).end()
 				},
 				_ => {
-				    for(let i in data.headers) {
-					if(data.headers.hasOwnProperty(i))
-					    res.append(i, data.headers[i])
-				    }
+				    forward_response_headers(data, res)
 				    console.log(data.body)
 				    res.send(data.body).end()
 				})
@@ -185,42 +235,39 @@ app.get(/^\/api\/(.+)/, (req, res) => {
     }
     else {
 	match = /^\/api\/(.+)/.exec(req.path)
-	let buffer = []
-	if(req.query) {
-	    for(let i in req.query) {
-		if(req.query.hasOwnProperty(i)) {
-		    buffer.push(`${i}=${req.query[i]}`)
-		}
-	    }
-	}
-
-	let data_res;
-	let headers = req.headers;
-	delete headers.host
-	from(httpPromise({hostname:db_host, path:`/${match[1]}?${buffer.join('&')}`,port:db_port,method:"GET"}))
-	    .subscribe(
-		d => {
-		    data_res = d;
+	check_public_dbs(req).
+	    subscribe(
+		_ => {
 		},
 		err => {
-		    console.log(`some error occurred ${err}`)
-		    res.status(500).end()
+		    console.log(err)
+		    res.status(401).end()
 		},
 		_ => {
-		    if(data_res) {
-//			console.log(data_res.headers)
-			for(let i in data_res.headers) {
-			    if(data_res.headers.hasOwnProperty(i)) {
-//				console.log(`appending ${i}`)
-				res.append(i, data_res.headers[i])
-			    }
-			}
-			
-			res.write(data_res.body)
-			res.end()
-		    }
+		    
+		    
+		    let data_res;
+		    let headers = req.headers;
+		    delete headers.host
+		    from(httpPromise({hostname:db_host, path:`/${match[1]}?${build_query_string(req)}`,port:db_port,method:"GET"}))
+			.subscribe(
+			    d => {
+				data_res = d;
+			    },
+			    err => {
+				console.log(`some error occurred ${err}`)
+				res.status(500).end()
+			    },
+			    _ => {
+				if(data_res) {
+				    forward_response_headers(data_res, res)
+				    res.write(data_res.body)
+				    res.end()
+				}
+			    })
 		})
     }
+	    
 })
 
 app.post(/^\/api\/(.*)/, (req, res) => {
@@ -264,8 +311,10 @@ app.put(/^\/api\/(.*)/, (req, res) => {
 		    let match = /^\/api\/decks\/(.+)/.exec(req.path)
 		    if(match) {
 			console.log(`adding ${match[1]} to user decks with ${req.body}`)
-			
-			from(httpPromise({hostname:db_host,port:db_port,path:`/decks_${user_id}/${match[1]}`,method:"PUT"}, JSON.stringify(req.body)))
+			let buffer = []
+			readRequestData(req)
+			    .map(JSON.parse)
+			    .mergeMap(data => httpPromise({hostname:db_host,port:db_port,path:`/decks_${user_id}/${match[1]}`,method:"PUT"}, JSON.stringify(data)))
 			    .subscribe(
 				_ => {
 				},
@@ -291,6 +340,34 @@ app.put(/^\/api\/(.*)/, (req, res) => {
 	res.status(401).end()
     }
     
+})
+
+app.delete(/^\/api\/(.+)\/(.+)/, (req,res) => {
+    let user_id;
+    checkAccessToken(req)
+	.subscribe(
+	    ({user_id:id}) => {
+		user_id = id
+	    },
+	    err => {
+		res.status(401).end()
+	    },
+	    _ => {
+		if(req.params[0] === 'decks') {
+		    from(httpPromise({hostname:db_host,port:db_port,path:`/decks_${user_id}/${req.params[1]}?${build_query_string(req)}`,method:"DELETE"}))
+			 .subscribe(
+			     _ => {
+			     },
+			     err => {
+				 res.status(401).end()
+			     },
+			     _ => {
+				 res.status(200).end()
+			     })
+		}
+		else if(req.params[1] === 'library') {
+		}
+	    })
 })
 
 app.listen(9000)
